@@ -176,6 +176,11 @@ cmd_up() {
   mkdir -p "$STATE"
   out=$(awg-quick up "$name" 2>&1) || { awg-quick down "$name" >/dev/null 2>&1; fail "awg-quick: $(tail -n 2 <<<"$out")"; }
   printf '%s' "$name" >"$STATE/active"
+  # UFW sets rp_filter=1 (strict) system-wide. Decrypted replies then arrive on
+  # the tunnel while the reverse route says otherwise, and are dropped. The
+  # kernel uses max(all, interface), so loose (2) on this interface only
+  # relaxes the tunnel and leaves every other interface strict.
+  sysctl -qw "net.ipv4.conf.$name.rp_filter=2" 2>/dev/null
   hs=-1
   for i in $(seq 1 20); do          # up to 10 s for the first handshake
     hs=$(handshake_age "$name"); [[ $hs -ge 0 ]] && break; sleep 0.5
@@ -187,8 +192,14 @@ cmd_up() {
   # Many servers (Proton free among them) drop ICMP, so ping alone would call a
   # working tunnel dead. Real traffic is HTTPS to an IP (no DNS needed).
   if ! traffic_ok; then
+    # Say exactly why before tearing down, so a failure can be fixed, not guessed.
+    local why
+    why="curl: $(curl -sS -m 5 -o /dev/null https://1.1.1.1/cdn-cgi/trace 2>&1 | head -c 160)"
+    why+="; route: $(ip route get 1.1.1.1 2>&1 | head -1 | head -c 120)"
+    why+="; transfer: $(awg show "$name" transfer 2>/dev/null | awk '{ print "rx " $2 " tx " $3 }' | head -1)"
+    why+="; rp_filter all=$(sysctl -n net.ipv4.conf.all.rp_filter 2>/dev/null) $name=$(sysctl -n "net.ipv4.conf.$name.rp_filter" 2>/dev/null)"
     awg-quick down "$name" >/dev/null 2>&1; rm -f "$STATE/active"
-    fail "handshake OK but no traffic through the tunnel. Disconnected again; run Diagnose." 4
+    fail "handshake OK but no traffic through the tunnel. Disconnected again. ($why)" 4
   fi
   local dns=false
   timeout 6 getent hosts one.one.one.one >/dev/null 2>&1 && dns=true
