@@ -1,0 +1,271 @@
+#!/bin/bash
+# omarchy-amnezia-helper: the only privileged part of omarchy-amnezia.
+#
+# Runs as root through one sudoers rule (installed by install.sh). Every
+# argument is validated; configs are parsed against an allow-list, so a config
+# can never carry PostUp/PreUp/PostDown/PreDown/Table/SaveConfig and run
+# commands as root. Output is JSON on stdout; errors are JSON with "error".
+#
+#   list                      configs in /etc/amnezia/amneziawg
+#   status                    the active tunnel, handshake age, traffic
+#   import NAME < file.conf   validate and store a config (0600, root)
+#   remove NAME               bring down if active, delete
+#   obfuscate NAME on|off     add/remove junk packets (Jc/Jmin/Jmax)
+#   up NAME                   connect; verifies handshake + traffic and
+#                             disconnects again by itself if either fails
+#   down                      disconnect whatever omarchy-amnezia brought up
+#   diagnose NAME             test NAME inside a throwaway network namespace;
+#                             never touches the real routing table
+#   autostart NAME|off        connect NAME at boot (awg-quick@NAME.service)
+set -uo pipefail
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin
+umask 077
+
+DIR=/etc/amnezia/amneziawg
+STATE=/run/omarchy-amnezia
+NAME_RE='^[A-Za-z0-9_-]{1,15}$'
+MAX_CONF=65536
+# Junk packets before the handshake. Standard WireGuard servers ignore them, so
+# this is safe for any server, and it hides the fixed-size handshake that DPI
+# fingerprints. Values from AmneziaWG's recommended range.
+JUNK=("Jc = 4" "Jmin = 40" "Jmax = 70")
+
+json_str() { # json_str VALUE -> quoted JSON string
+  local s=${1//\\/\\\\}; s=${s//\"/\\\"}; s=${s//$'\n'/\\n}; s=${s//$'\t'/\\t}; s=${s//$'\r'/}
+  printf '"%s"' "$s"
+}
+fail() { printf '{"ok":false,"error":%s}\n' "$(json_str "$1")"; exit "${2:-1}"; }
+need_name() { [[ ${1:-} =~ $NAME_RE ]] || fail "invalid name: use 1-15 letters, digits, - or _"; }
+conf_of() { printf '%s/%s.conf' "$DIR" "$1"; }
+
+# Allow-listed keys only. Prints nothing on success, the problem on failure.
+validate() { # validate FILE
+  awk '
+    BEGIN { IGNORECASE = 1; sec = ""; peers = 0; iface = 0; bad = "" }
+    { sub(/\r$/, "") }
+    /^[ \t]*($|#|;)/ { next }
+    /^[ \t]*\[[^]]+\][ \t]*$/ {
+      s = $0; gsub(/[ \t\[\]]/, "", s); s = tolower(s)
+      if (s == "interface") { sec = s; iface++ }
+      else if (s == "peer") { sec = s; peers++ }
+      else { bad = "unknown section [" s "]"; exit }
+      next
+    }
+    {
+      line = $0
+      if (index(line, "=") == 0) { bad = "line without key = value"; exit }
+      k = substr(line, 1, index(line, "=") - 1); gsub(/[ \t]/, "", k); k = tolower(k)
+      if (sec == "interface") {
+        if (k !~ /^(privatekey|address|dns|mtu|listenport|jc|jmin|jmax|s[1-4]|h[1-4]|i[1-5]|j[1-3]|itime)$/) { bad = "key not allowed in [Interface]: " k; exit }
+        if (k == "privatekey") havekey = 1
+      } else if (sec == "peer") {
+        if (k !~ /^(publickey|presharedkey|allowedips|endpoint|persistentkeepalive)$/) { bad = "key not allowed in [Peer]: " k; exit }
+        if (k == "endpoint") haveep = 1
+      } else { bad = "key outside a section"; exit }
+    }
+    END {
+      if (bad == "" && iface != 1) bad = "need exactly one [Interface]"
+      if (bad == "" && peers < 1) bad = "need at least one [Peer]"
+      if (bad == "" && !havekey) bad = "missing PrivateKey"
+      if (bad == "" && !haveep) bad = "missing Endpoint"
+      if (bad != "") print bad
+    }' "$1"
+}
+
+# Values of a key from the [Interface] section (first match).
+iface_val() { # iface_val FILE KEY
+  awk -v want="$(tr '[:upper:]' '[:lower:]' <<<"$2")" '
+    /^[ \t]*\[/ { s = tolower($0); gsub(/[ \t\[\]]/, "", s); sec = s; next }
+    sec == "interface" && index($0, "=") {
+      k = substr($0, 1, index($0, "=") - 1); gsub(/[ \t]/, "", k)
+      if (tolower(k) == want) { v = substr($0, index($0, "=") + 1); gsub(/^[ \t]+|[ \t]+$/, "", v); print v; exit }
+    }' "$1"
+}
+peer_endpoint() { awk 'index($0,"=") { k=substr($0,1,index($0,"=")-1); gsub(/[ \t]/,"",k); if (tolower(k)=="endpoint") { v=substr($0,index($0,"=")+1); gsub(/^[ \t]+|[ \t]+$/,"",v); print v; exit } }' "$1"; }
+
+is_up() { ip link show dev "$1" >/dev/null 2>&1; }
+active_name() { [[ -s $STATE/active ]] && n=$(<"$STATE/active") && [[ $n =~ $NAME_RE ]] && is_up "$n" && printf '%s' "$n"; }
+
+handshake_age() { # handshake_age IFACE -> seconds since last handshake, -1 if none
+  local t now; t=$(awg show "$1" latest-handshakes 2>/dev/null | awk '{ if ($2 > m) m = $2 } END { print m + 0 }')
+  now=$(date +%s); [[ ${t:-0} -gt 0 ]] && echo $((now - t)) || echo -1
+}
+
+cmd_list() {
+  local first=1 f n ep jc s1 h1
+  printf '['
+  for f in "$DIR"/*.conf; do
+    [[ -f $f ]] || continue
+    n=$(basename "$f" .conf); [[ $n =~ $NAME_RE ]] || continue
+    ep=$(peer_endpoint "$f"); ep=${ep%:*}
+    jc=$(iface_val "$f" Jc); s1=$(iface_val "$f" S1); h1=$(iface_val "$f" H1)
+    ((first)) || printf ','; first=0
+    printf '{"name":%s,"endpoint":%s,"junk":%s,"awg":%s}' "$(json_str "$n")" "$(json_str "$ep")" \
+      "$([[ -n $jc && $jc != 0 ]] && echo true || echo false)" \
+      "$([[ -n $s1 && $s1 != 0 ]] || [[ -n $h1 && $h1 != 1 ]] && echo true || echo false)"
+  done
+  printf ']\n'
+}
+
+cmd_status() {
+  local n hs rx=0 tx=0 ep="" auto=""
+  n=$(active_name || true)
+  for f in /etc/systemd/system/multi-user.target.wants/awg-quick@*.service; do
+    [[ -e $f ]] && { auto=${f##*awg-quick@}; auto=${auto%.service}; }
+  done
+  if [[ -n $n ]]; then
+    hs=$(handshake_age "$n")
+    read -r rx tx < <(awg show "$n" transfer 2>/dev/null | awk '{ r += $2; t += $3 } END { print r + 0, t + 0 }')
+    ep=$(awg show "$n" endpoints 2>/dev/null | awk 'NR==1 { print $2 }'); ep=${ep%:*}
+    printf '{"ok":true,"active":%s,"handshake":%s,"rx":%s,"tx":%s,"endpoint":%s,"autostart":%s}\n' \
+      "$(json_str "$n")" "$hs" "${rx:-0}" "${tx:-0}" "$(json_str "$ep")" "$(json_str "$auto")"
+  else
+    printf '{"ok":true,"active":"","handshake":-1,"rx":0,"tx":0,"endpoint":"","autostart":%s}\n' "$(json_str "$auto")"
+  fi
+}
+
+cmd_import() {
+  need_name "${1:-}"; local name=$1 tmp problem
+  tmp=$(mktemp "$DIR/.import.XXXXXX") || fail "cannot write to $DIR"
+  head -c $((MAX_CONF + 1)) >"$tmp"
+  if (($(stat -c %s "$tmp") > MAX_CONF)); then rm -f "$tmp"; fail "config is too large"; fi
+  sed -i 's/\r$//' "$tmp"
+  problem=$(validate "$tmp")
+  if [[ -n $problem ]]; then rm -f "$tmp"; fail "not a usable WireGuard/AmneziaWG config: $problem"; fi
+  chmod 600 "$tmp" && mv -f "$tmp" "$(conf_of "$name")" || { rm -f "$tmp"; fail "could not save"; }
+  printf '{"ok":true,"name":%s}\n' "$(json_str "$name")"
+}
+
+cmd_remove() {
+  need_name "${1:-}"; local f; f=$(conf_of "$1"); [[ -f $f ]] || fail "no such config"
+  [[ $(active_name || true) == "$1" ]] && cmd_down >/dev/null
+  systemctl disable "awg-quick@$1.service" >/dev/null 2>&1 || true
+  rm -f "$f"; printf '{"ok":true}\n'
+}
+
+cmd_obfuscate() {
+  need_name "${1:-}"; local f; f=$(conf_of "$1"); [[ -f $f ]] || fail "no such config"
+  [[ ${2:-} == on || ${2:-} == off ]] || fail "use on or off"
+  # Drop any Jc/Jmin/Jmax first (keeps every other line, comments included).
+  local tmp; tmp=$(mktemp "$DIR/.obf.XXXXXX")
+  awk 'BEGIN{IGNORECASE=1} !/^[ \t]*(Jc|Jmin|Jmax)[ \t]*=/' "$f" >"$tmp"
+  if [[ $2 == on ]]; then
+    local add; add=$(printf '%s\\n' "${JUNK[@]}")
+    awk -v add="$add" 'BEGIN{IGNORECASE=1} { print } /^[ \t]*\[Interface\][ \t]*$/ && !done { printf "%s", add; done=1 }' "$tmp" >"$tmp.2" \
+      && mv -f "$tmp.2" "$tmp"
+  fi
+  chmod 600 "$tmp" && mv -f "$tmp" "$f"
+  printf '{"ok":true,"junk":%s}\n' "$([[ $2 == on ]] && echo true || echo false)"
+}
+
+cmd_down() {
+  local n; n=$(active_name || true)
+  if [[ -n $n ]]; then awg-quick down "$n" >/dev/null 2>&1; fi
+  rm -f "$STATE/active"
+  printf '{"ok":true}\n'
+}
+
+# Connect, then prove the tunnel carries traffic. Anything less is undone, so a
+# blocked server can never leave the machine with a dead default route.
+cmd_up() {
+  need_name "${1:-}"; local name=$1 f out hs i
+  f=$(conf_of "$name"); [[ -f $f ]] || fail "no such config"
+  [[ -z $(validate "$f") ]] || fail "config failed validation; re-import it"
+  cmd_down >/dev/null
+  is_up "$name" && awg-quick down "$name" >/dev/null 2>&1
+  mkdir -p "$STATE"
+  out=$(awg-quick up "$name" 2>&1) || { awg-quick down "$name" >/dev/null 2>&1; fail "awg-quick: $(tail -n 2 <<<"$out")"; }
+  printf '%s' "$name" >"$STATE/active"
+  hs=-1
+  for i in $(seq 1 20); do          # up to 10 s for the first handshake
+    hs=$(handshake_age "$name"); [[ $hs -ge 0 ]] && break; sleep 0.5
+  done
+  if [[ $hs -lt 0 ]]; then
+    awg-quick down "$name" >/dev/null 2>&1; rm -f "$STATE/active"
+    fail "no handshake: the server did not answer (blocked, wrong key, or down). Disconnected again; try Obfuscation or Diagnose." 3
+  fi
+  # Many servers (Proton free among them) drop ICMP, so ping alone would call a
+  # working tunnel dead. Real traffic is HTTPS to an IP (no DNS needed).
+  if ! traffic_ok; then
+    awg-quick down "$name" >/dev/null 2>&1; rm -f "$STATE/active"
+    fail "handshake OK but no traffic through the tunnel. Disconnected again; run Diagnose." 4
+  fi
+  local dns=false
+  timeout 6 getent hosts one.one.one.one >/dev/null 2>&1 && dns=true
+  printf '{"ok":true,"active":%s,"handshake":%s,"dns":%s}\n' "$(json_str "$name")" "$hs" "$dns"
+}
+
+traffic_ok() {
+  curl -s -m 6 -o /dev/null https://1.1.1.1/cdn-cgi/trace && return 0
+  curl -s -m 6 -o /dev/null https://9.9.9.9/ && return 0
+  ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1
+}
+
+# Bring the config up inside its own network namespace: the UDP socket stays in
+# the real namespace (that is how WireGuard works), but every route, address and
+# test packet lives in the throwaway namespace, so the machine's own
+# connectivity is never touched. Reports handshake, ping and HTTPS separately.
+cmd_diagnose() {
+  need_name "${1:-}"; local name=$1 f ns="oa-diag" dev="oadiag0" stripped addr hs=-1 i ping_ok=false https_ok=false loss="100"
+  f=$(conf_of "$name"); [[ -f $f ]] || fail "no such config"
+  [[ -z $(validate "$f") ]] || fail "config failed validation"
+  cleanup() { ip netns del "$ns" 2>/dev/null; ip link del "$dev" 2>/dev/null; rm -f "${stripped:-}"; }
+  trap cleanup EXIT
+  cleanup
+  stripped=$(mktemp); awg-quick strip "$f" >"$stripped" 2>/dev/null || fail "could not parse config"
+  ip netns add "$ns" || fail "could not create namespace"
+  ip link add dev "$dev" type amneziawg 2>/dev/null || { modprobe amneziawg 2>/dev/null; ip link add dev "$dev" type amneziawg; } || fail "amneziawg kernel module missing (install amneziawg-dkms)"
+  awg setconf "$dev" "$stripped" || fail "awg rejected the config"
+  ip link set "$dev" netns "$ns" || fail "could not move interface"
+  for addr in $(iface_val "$f" Address | tr ',' ' '); do
+    [[ $addr == *:* ]] && continue
+    ip -n "$ns" addr add "$addr" dev "$dev" 2>/dev/null
+  done
+  ip -n "$ns" link set lo up; ip -n "$ns" link set "$dev" up
+  ip -n "$ns" route add default dev "$dev"
+  # A handshake only starts once there is traffic to send.
+  ip netns exec "$ns" ping -c 1 -W 1 1.1.1.1 >/dev/null 2>&1 &
+  for i in $(seq 1 16); do
+    hs=$(ip netns exec "$ns" awg show "$dev" latest-handshakes 2>/dev/null | awk '{ if ($2 > m) m = $2 } END { print m + 0 }')
+    [[ ${hs:-0} -gt 0 ]] && { hs=$(( $(date +%s) - hs )); break; }; hs=-1; sleep 0.5
+  done
+  wait
+  if [[ $hs -ge 0 ]]; then
+    loss=$(ip netns exec "$ns" ping -c 4 -i 0.3 -W 2 1.1.1.1 2>/dev/null | grep -oE '[0-9.]+% packet loss' | grep -oE '^[0-9.]+')
+    [[ ${loss:-100} != 100 ]] && ping_ok=true
+    { ip netns exec "$ns" curl -s -m 8 -o /dev/null https://1.1.1.1/cdn-cgi/trace \
+      || ip netns exec "$ns" curl -s -m 8 -o /dev/null https://9.9.9.9/; } && https_ok=true
+  fi
+  local rxtx; rxtx=$(ip netns exec "$ns" awg show "$dev" transfer 2>/dev/null | awk '{ r += $2; t += $3 } END { print r + 0 "," t + 0 }')
+  printf '{"ok":true,"name":%s,"handshake":%s,"loss":%s,"ping":%s,"https":%s,"rx":%s,"tx":%s}\n' \
+    "$(json_str "$name")" "$hs" "${loss:-100}" "$ping_ok" "$https_ok" "${rxtx%,*}" "${rxtx#*,}"
+}
+
+cmd_autostart() {
+  local cur f
+  for f in /etc/systemd/system/multi-user.target.wants/awg-quick@*.service; do
+    [[ -e $f ]] || continue; cur=${f##*awg-quick@}; cur=${cur%.service}
+    systemctl disable "awg-quick@$cur.service" >/dev/null 2>&1
+  done
+  if [[ ${1:-} != off ]]; then
+    need_name "${1:-}"; [[ -f $(conf_of "$1") ]] || fail "no such config"
+    systemctl enable "awg-quick@$1.service" >/dev/null 2>&1 || fail "could not enable autostart"
+  fi
+  printf '{"ok":true}\n'
+}
+
+[[ $EUID -eq 0 ]] || fail "must run as root (through sudo)"
+mkdir -p "$DIR"; chmod 700 "$DIR"
+cmd=${1:-}; shift || true
+case $cmd in
+  list) cmd_list ;;
+  status) cmd_status ;;
+  import) cmd_import "$@" ;;
+  remove) cmd_remove "$@" ;;
+  obfuscate) cmd_obfuscate "$@" ;;
+  up) cmd_up "$@" ;;
+  down) cmd_down ;;
+  diagnose) cmd_diagnose "$@" ;;
+  autostart) cmd_autostart "$@" ;;
+  *) fail "usage: list|status|import NAME|remove NAME|obfuscate NAME on|off|up NAME|down|diagnose NAME|autostart NAME|off" ;;
+esac

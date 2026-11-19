@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "malekabokhatwa.amnezia",
+  "name": "AmneziaWG",
+  "version": "1.0.0",
+  "author": "Malek Abokhatwa",
+  "license": "MIT",
+  "description": "AmneziaWG (obfuscated WireGuard) in the Omarchy bar: connect, import .conf files, add DPI-beating junk packets, and diagnose safely in a sandbox.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "AmneziaWG",
+    "description": "Connect, import and diagnose AmneziaWG / WireGuard configs from the bar.",
+    "category": "Network",
+    "aliases": ["vpn", "amnezia", "wireguard", "awg"],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {},
+    "schema": []
+  }
+}

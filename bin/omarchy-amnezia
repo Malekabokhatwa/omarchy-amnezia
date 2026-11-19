@@ -1,0 +1,85 @@
+#!/bin/bash
+# omarchy-amnezia: AmneziaWG (obfuscated WireGuard) from the terminal and the bar.
+#
+#   omarchy-amnezia status | list           JSON
+#   omarchy-amnezia candidates              .conf files you could import (JSON)
+#   omarchy-amnezia import FILE [NAME]      add a config (wg or awg .conf)
+#   omarchy-amnezia remove NAME
+#   omarchy-amnezia up [NAME]               connect (default: last used)
+#   omarchy-amnezia down
+#   omarchy-amnezia toggle                  down if connected, else up last
+#   omarchy-amnezia obfuscate NAME on|off   junk packets before the handshake
+#   omarchy-amnezia diagnose NAME           safe test in a sandbox namespace
+#   omarchy-amnezia autostart NAME|off      connect at boot
+#
+# Only the root helper is privileged; this script never runs as root.
+set -uo pipefail
+HELPER=/usr/local/lib/omarchy-amnezia/omarchy-amnezia-helper
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-amnezia"
+SEARCH=("$HOME/VPNs" "$HOME/Downloads" "$HOME/Documents" "$HOME")
+
+json_str() { local s=${1//\\/\\\\}; s=${s//\"/\\\"}; s=${s//$'\n'/\\n}; s=${s//$'\t'/\\t}; printf '"%s"' "$s"; }
+fail() { printf '{"ok":false,"error":%s}\n' "$(json_str "$1")"; exit 1; }
+h() {
+  [[ -x $HELPER ]] || fail "omarchy-amnezia is not installed (run install.sh)"
+  sudo -n "$HELPER" "$@" 2>/dev/null || {
+    local rc=$?
+    # sudo itself failing (no rule) prints nothing on stdout.
+    [[ $rc -eq 1 ]] && ! sudo -n -l "$HELPER" >/dev/null 2>&1 && fail "sudo rule missing (re-run install.sh)"
+    return $rc
+  }
+}
+notify() { command -v notify-send >/dev/null && notify-send -a "AmneziaWG" -i network-vpn "$@" 2>/dev/null; return 0; }
+remember() { mkdir -p "$STATE" && printf '%s' "$1" >"$STATE/last"; }
+last() { [[ -s $STATE/last ]] && cat "$STATE/last"; }
+sanitize() { local n; n=$(basename "$1"); n=${n%.conf}; n=$(tr -c 'A-Za-z0-9_-' '-' <<<"$n" | sed 's/-*$//; s/^-*//'); printf '%s' "${n:0:15}"; }
+
+cmd=${1:-status}; shift || true
+case $cmd in
+  status|list) h "$cmd" ;;
+
+  candidates)
+    # Plain or Amnezia WireGuard configs lying around, not yet imported.
+    imported=$(h list 2>/dev/null | grep -oE '"name":"[^"]*"' | cut -d'"' -f4)
+    first=1; printf '['
+    for d in "${SEARCH[@]}"; do
+      [[ -d $d ]] || continue
+      while IFS= read -r -d '' f; do
+        size=$(stat -c %s "$f" 2>/dev/null || echo 0); ((size > 0 && size < 65536)) || continue
+        grep -qi '^\s*\[Interface\]' "$f" && grep -qi '^\s*\[Peer\]' "$f" || continue
+        n=$(sanitize "$f"); grep -qxF "$n" <<<"$imported" && continue
+        ((first)) || printf ','; first=0
+        printf '{"path":%s,"name":%s}' "$(json_str "$f")" "$(json_str "$n")"
+      done < <(find "$d" -maxdepth 1 -type f -iname '*.conf' -print0 2>/dev/null)
+    done
+    printf ']\n' ;;
+
+  import)
+    f=${1:-}; [[ -f $f && -r $f ]] || fail "file not found: $f"
+    name=${2:-$(sanitize "$f")}; [[ -n $name ]] || name=awg0
+    out=$(h import "$name" <"$f") || { printf '%s\n' "$out"; exit 1; }
+    printf '%s\n' "$out"; [[ -z $(last) ]] && remember "$name"; notify "Imported $name" ;;
+
+  remove) h remove "${1:-}" ;;
+
+  up)
+    name=${1:-$(last)}; [[ -n $name ]] || fail "no config chosen yet"
+    out=$(h up "$name"); rc=$?
+    printf '%s\n' "$out"
+    if ((rc == 0)); then
+      remember "$name"
+      if grep -q '"dns":false' <<<"$out"; then notify -u critical "Connected to $name, but DNS is not answering" "Websites by name may fail; the config's DNS server may be unreachable."
+      else notify "Connected to $name"; fi
+    else notify -u critical "Could not connect to $name" "$(grep -oE '"error":"[^"]*"' <<<"$out" | cut -d'"' -f4)"; exit $rc; fi ;;
+
+  down) h down; notify "Disconnected" ;;
+
+  toggle)
+    if h status | grep -q '"active":""'; then exec "$0" up; else exec "$0" down; fi ;;
+
+  obfuscate) h obfuscate "${1:-}" "${2:-}" ;;
+  diagnose) h diagnose "${1:-$(last)}" ;;
+  autostart) h autostart "${1:-}" ;;
+  -h|--help|help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) fail "unknown command: $cmd (see omarchy-amnezia help)" ;;
+esac
