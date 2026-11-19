@@ -146,9 +146,6 @@ Panel {
               : vpn.busyAction === "down" ? strings.t("disconnecting")
               : vpn.connected ? strings.t("connectedTo").arg(vpn.active)
               : strings.t("disconnected")
-            detail: vpn.connected
-              ? "↓ " + root.formatBytes(vpn.rx) + "   ↑ " + root.formatBytes(vpn.tx) + "   ·   " + root.handshakeText(vpn.handshake)
-              : ""
             foreground: root.foreground
             fontFamily: root.fontFamily
             iconOpacity: vpn.connected ? 1.0 : 0.5
@@ -176,6 +173,20 @@ Panel {
                 }
               }
             }
+          }
+
+          // Live traffic, on its own line so the hero keeps its title.
+          Text {
+            visible: vpn.connected
+            width: parent.width
+            textFormat: Text.PlainText
+            text: "↓ " + root.formatBytes(vpn.rx) + "    ↑ " + root.formatBytes(vpn.tx)
+              + "    ·    " + root.handshakeText(vpn.handshake)
+              + (vpn.endpoint !== "" ? "    ·    " + vpn.endpoint : "")
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            elide: Text.ElideRight
           }
 
           // Errors and confirmations, always plain text.

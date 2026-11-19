@@ -130,6 +130,8 @@ Item {
         root.tx = Number(j.tx) || 0
         root.endpoint = root.clip(j.endpoint, 64)
         root.autostart = root.clip(j.autostart, 15)
+        // The CLI (or a right-click) may have switched configs since we looked.
+        if (root.panelOpen && !lastProc.running) lastProc.running = true
       }
     }
   }

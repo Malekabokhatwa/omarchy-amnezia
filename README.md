@@ -21,6 +21,13 @@ This was measured, not guessed (on a network in Egypt, Proton free servers):
 | Proton NL #112 | no handshake | handshake in 1 s |
 | Proton NL #132 | no handshake | handshake in 1 s, HTTPS works |
 
+With the handshake through, there was a second trap: the tunnel passed small
+packets but TLS died with `unexpected eof`, because the path drops full-size
+packets at WireGuard's default MTU (1420). At MTU 1280 the same server gave
+**2.9 MB/s** and normal browsing. The helper now detects this on connect,
+steps the MTU down (1380, then 1280), and saves the value that works into
+that config.
+
 [AmneziaWG](https://docs.amnezia.org/documentation/amnezia-wg/) can send junk
 packets before the handshake. **Ordinary WireGuard servers ignore them**, so you
 get obfuscation against any server, including commercial ones, with no server
@@ -44,6 +51,9 @@ are used as they are.
   handshake and real traffic (HTTPS by IP, or ping) and **disconnects again by
   itself** within seconds if either is missing. A blocked server can't leave
   you with a dead default route.
+- **Fixes the two silent killers on its own**: an MTU the path can't carry
+  (found and saved per config) and UFW's strict `rp_filter` (relaxed on the
+  tunnel interface only; everything else stays strict).
 - **Connect at boot** for the config you choose.
 - CLI for everything: `omarchy-amnezia help`.
 

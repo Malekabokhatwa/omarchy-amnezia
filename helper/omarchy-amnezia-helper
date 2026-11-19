@@ -191,7 +191,22 @@ cmd_up() {
   fi
   # Many servers (Proton free among them) drop ICMP, so ping alone would call a
   # working tunnel dead. Real traffic is HTTPS to an IP (no DNS needed).
-  if ! traffic_ok; then
+  # Paths that drop full-size packets show a good handshake and small packets
+  # but break TLS ("unexpected eof"): step the MTU down, and save what works.
+  local mtu_fixed=""
+  if ! traffic_ok && [[ -z $(iface_val "$f" MTU) ]]; then
+    local m
+    for m in 1380 1280; do
+      ip link set dev "$name" mtu "$m" 2>/dev/null || continue
+      if traffic_ok; then
+        mtu_fixed=$m
+        awk -v m="$m" '{ print } /^[ \t]*\[Interface\][ \t]*$/ && !done { print "MTU = " m; done = 1 }' "$f" >"$f.tmp" \
+          && chmod 600 "$f.tmp" && mv -f "$f.tmp" "$f"
+        break
+      fi
+    done
+  fi
+  if [[ -z $mtu_fixed ]] && ! traffic_ok; then
     # Say exactly why before tearing down, so a failure can be fixed, not guessed.
     local why
     why="curl: $(curl -sS -m 5 -o /dev/null https://1.1.1.1/cdn-cgi/trace 2>&1 | head -c 160)"
@@ -203,7 +218,7 @@ cmd_up() {
   fi
   local dns=false
   timeout 6 getent hosts one.one.one.one >/dev/null 2>&1 && dns=true
-  printf '{"ok":true,"active":%s,"handshake":%s,"dns":%s}\n' "$(json_str "$name")" "$hs" "$dns"
+  printf '{"ok":true,"active":%s,"handshake":%s,"dns":%s,"mtu_fixed":%s}\n' "$(json_str "$name")" "$hs" "$dns" "${mtu_fixed:-0}"
 }
 
 traffic_ok() {
